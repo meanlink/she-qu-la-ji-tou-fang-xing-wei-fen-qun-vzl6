@@ -1,0 +1,84 @@
+name: waste-sorting-segments
+x-app: &app
+  build: ./backend
+  environment:
+    MYSQL_HOST: db
+    MYSQL_USER: sorting_ops
+    MYSQL_PASSWORD: ${MYSQL_PASSWORD:-sorting-local-db}
+    MYSQL_DATABASE: sorting_field
+    REDIS_URL: redis://redis:6379/0
+    JWT_SECRET: ${JWT_SECRET:-local-sorting-board-signing-key-change-in-production}
+    SEED_DEMO: ${SEED_DEMO:-true}
+  volumes:
+    - field_runtime:/runtime
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+services:
+  db:
+    image: mysql:8.0
+    container_name: ${COMPOSE_PROJECT_NAME:-waste-sorting-segments}-db
+    environment:
+      MYSQL_DATABASE: sorting_field
+      MYSQL_USER: sorting_ops
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-sorting-local-db}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-sorting-local-root}
+    volumes:
+      - sorting_db:/var/lib/mysql
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/01-field.sql:ro
+    ports:
+      - 127.0.0.1:${DB_PORT:-17755}:3306
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -h 127.0.0.1 -u "$$MYSQL_USER" "$$MYSQL_DATABASE" -e "SELECT id FROM field_register" >/dev/null']
+      interval: 4s
+      timeout: 4s
+      retries: 35
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-waste-sorting-segments}-redis
+    volumes:
+      - sorting_redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 4s
+      timeout: 3s
+      retries: 12
+  backend:
+    <<: *app
+    container_name: ${COMPOSE_PROJECT_NAME:-waste-sorting-segments}-backend
+    command: [uvicorn, src.main:app, --host, 0.0.0.0, --port, '8000']
+    ports:
+      - 127.0.0.1:${BACKEND_PORT:-19255}:8000
+    healthcheck:
+      test: [CMD, python, -c, "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 4s
+      timeout: 4s
+      retries: 20
+  worker:
+    <<: *app
+    container_name: ${COMPOSE_PROJECT_NAME:-waste-sorting-segments}-worker
+    command: [python, -m, src.worker]
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; import time, sys; sys.exit(time.time() - Path('/runtime/sorting-pulse').stat().st_mtime > 20)"]
+      interval: 4s
+      timeout: 4s
+      retries: 20
+  frontend:
+    build: ./frontend
+    container_name: ${COMPOSE_PROJECT_NAME:-waste-sorting-segments}-frontend
+    ports:
+      - 127.0.0.1:${FRONTEND_PORT:-18255}:80
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -qO, /dev/null, 'http://127.0.0.1/']
+      interval: 4s
+      timeout: 3s
+      retries: 15
+volumes:
+  sorting_db:
+  sorting_redis:
+  field_runtime:
