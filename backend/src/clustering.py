@@ -44,9 +44,10 @@ def group_label(totals):
     return '稳定投放点位'
 
 
-def fit(points, requested):
-    """Full average-linkage tree and a reproducible cut; keys break distance ties."""
-    members = {p['id']: profile(p) for p in points}
+def prepare(points, requested):
+    """Profile, standardise and build the immutable pairwise distance table."""
+    # String keys survive a JSON checkpoint round-trip (MySQL JSON object keys are strings).
+    members = {str(p['id']): profile(p) for p in points}
     columns = [[member[feature] for member in members.values()] for feature in FEATURES]
     scales = [(mean(column), pstdev(column)) for column in columns]
     vectors = {
@@ -57,12 +58,28 @@ def fit(points, requested):
     if len(set(vectors.values())) < requested:
         return None
     pairs = {frozenset((a, b)): dist(vectors[a], vectors[b]) for a, b in combinations(vectors, 2)}
-    active = sorted((key,) for key in members)
-    cut = None
-    merges = []
+    # JSON-safe: keys become sorted lists, values kept as plain floats.
+    return {'members': members,
+            'pairs': [[sorted(key), value] for key, value in pairs.items()]}
+
+
+def merge_tree(prepared, requested, checkpoint=None, on_step=None):
+    """Average-linkage agglomeration; resumes from the persisted active clusters."""
+    members = prepared['members']
+    pairs = {frozenset(key): value for key, value in prepared['pairs']}
+    if checkpoint:
+        active = [tuple(str(key) for key in cluster) for cluster in checkpoint['active']]
+        merges = list(checkpoint['merges'])
+        cut = [tuple(str(key) for key in cluster) for cluster in checkpoint['cut']] \
+            if checkpoint.get('cut') else None
+        start_step = checkpoint['steps']
+    else:
+        active = sorted((key,) for key in members)
+        merges, cut, start_step = [], None, 0
+    step = start_step
     while len(active) > 1:
         if len(active) == requested:
-            cut = active.copy()
+            cut = [cluster for cluster in active]
         distance, left, right = min(
             (mean(pairs[frozenset((a, b))] for a in x for b in y), x, y)
             for x, y in combinations(active, 2)
@@ -73,6 +90,16 @@ def fit(points, requested):
         active.remove(left)
         active.remove(right)
         active = sorted([*active, merged])
+        step += 1
+        if on_step:
+            # Persistable state after each merge so an interrupted run continues in place.
+            state = {'phase': 'merge', 'steps': step, 'total_steps': len(members) - 1,
+                     'active': [list(cluster) for cluster in active],
+                     'cut': [list(cluster) for cluster in cut] if cut else None,
+                     'merges': merges, 'prepared': prepared}
+            on_step(state)
+    if cut is None:
+        raise ArithmeticError('层次聚类无法切出所选群数')
     groups = []
     for number, keys in enumerate(cut, 1):
         rows = [members[key] for key in keys]
@@ -81,3 +108,14 @@ def fit(points, requested):
                        'samples': sum(row['sample_count'] for row in rows),
                        'members': [dict(row, action=intervention(row)) for row in rows]})
     return {'method': 'average_linkage_zscore_euclidean', 'groups': groups, 'merges': merges}
+
+
+def fit(points, requested, checkpoint=None, on_step=None):
+    """Full average-linkage tree and a reproducible cut; keys break distance ties."""
+    if checkpoint and checkpoint.get('phase') == 'merge' and 'prepared' in checkpoint:
+        prepared = checkpoint['prepared']
+    else:
+        prepared = prepare(points, requested)
+        if prepared is None:
+            return None
+    return merge_tree(prepared, requested, checkpoint, on_step)

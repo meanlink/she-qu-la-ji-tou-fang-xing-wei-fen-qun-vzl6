@@ -1,4 +1,8 @@
+import os
+import socket
+import uuid
 from collections import defaultdict
+from datetime import datetime, timedelta
 from hashlib import sha256
 
 from fastapi import HTTPException
@@ -11,10 +15,16 @@ from src.storage import encode, register
 MIN_ANONYMOUS = 30
 MIN_WINDOWS = 2
 MAX_POINTS = 80
+# A worker heartbeat tick is ~1s; a lease this long survives brief stalls without blocking resume.
+LEASE_SECONDS = 30
 
 
 def get_run(ledger, run_id):
     return required(ledger, 'SELECT * FROM behavior_runs WHERE id=%s', run_id, '分群运行')
+
+
+def worker_identity():
+    return f'{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}'
 
 
 def collect_snapshot(ledger, start, end, clusters):
@@ -55,6 +65,17 @@ def collect_snapshot(ledger, start, end, clusters):
     return snapshot, sha256(encode(snapshot).encode()).hexdigest(), reasons
 
 
+def _requeue(ledger, run, snapshot, checksum, reasons, actor, attempt):
+    """Re-evaluate a run against current source data and move it back onto the same run row."""
+    state = RunState.PAUSED if reasons else RunState.QUEUED
+    ledger.execute('''UPDATE behavior_runs SET state=%s,attempt=%s,reasons=%s,input_snapshot=%s,
+        fingerprint=%s,result=NULL,checkpoint=NULL,lease_owner=NULL,lease_until=NULL,started_at=NULL WHERE id=%s''',
+                   (state, attempt, encode(reasons), encode(snapshot), checksum, run['id']))
+    ledger.audit(actor, f'run_{state}', run['id'],
+                 {'attempt': attempt, 'fingerprint': checksum, 'reasons': reasons})
+    return state
+
+
 def queue_run(form, actor):
     with register(write=True) as ledger:
         snapshot, checksum, reasons = collect_snapshot(ledger, form.from_day, form.through_day, form.clusters)
@@ -72,35 +93,107 @@ def queue_run(form, actor):
         return get_run(ledger, run_id)
 
 
-def verify_source(ledger, run, actor):
-    _, checksum, reasons = collect_snapshot(ledger, run['from_day'], run['through_day'], run['requested_clusters'])
-    if checksum == run['fingerprint'] and not reasons:
-        return True
-    reasons.insert(0, {'code': 'source_changed'})
-    ledger.execute("UPDATE behavior_runs SET state='paused',reasons=%s WHERE id=%s", (encode(reasons), run['id']))
-    ledger.audit(actor, 'run_paused', run['id'], {'reasons': reasons})
-    return False
-
-
-def compute_next():
+def retry_run(run_id, actor):
+    """Retry keeps the original run row: re-check current source data and requeue in place."""
     with register(write=True) as ledger:
+        run = get_run(ledger, run_id)
+        if run['state'] not in (RunState.PAUSED, RunState.FAILED):
+            raise HTTPException(409, '只有暂停或计算失败的分群可以重试')
+        snapshot, checksum, reasons = collect_snapshot(
+            ledger, run['from_day'], run['through_day'], run['requested_clusters'])
+        _requeue(ledger, run, snapshot, checksum, reasons, actor, run['attempt'] + 1)
+        return get_run(ledger, run_id)
+
+
+def resume_after_review(ledger, window_ids):
+    """Quality rulings may clear the last blocker: requeue affected paused runs on their own rows."""
+    wanted = set(window_ids)
+    resumed = []
+    for run in ledger.rows("SELECT * FROM behavior_runs WHERE state='paused' ORDER BY id"):
+        marks = {reason.get('window_id') for reason in run['reasons']
+                 if reason.get('code') == 'quality_pending'}
+        if not marks or not (marks & wanted):
+            continue
+        snapshot, checksum, reasons = collect_snapshot(
+            ledger, run['from_day'], run['through_day'], run['requested_clusters'])
+        if _requeue(ledger, run, snapshot, checksum, reasons, 'quality-review', run['attempt'] + 1) \
+                == RunState.QUEUED:
+            resumed.append(run['id'])
+    return resumed
+
+
+def compute_next(worker_id=None):
+    worker_id = worker_id or worker_identity()
+    with register(write=True) as ledger:
+        # Recover runs whose worker died mid-calculation once their lease expires.
+        ledger.execute('''UPDATE behavior_runs SET state='queued',lease_owner=NULL,lease_until=NULL
+            WHERE state='running' AND lease_until IS NOT NULL AND lease_until < UTC_TIMESTAMP()''')
         run = ledger.one("SELECT * FROM behavior_runs WHERE state='queued' ORDER BY id LIMIT 1")
-        if run is None or not verify_source(ledger, run, 'worker'):
-            return
-        try:
-            result = fit(run['input_snapshot']['points'], run['requested_clusters'])
-        except (ArithmeticError, ValueError, KeyError) as error:
+        if run is None:
+            return None
+        lease_until = datetime.utcnow() + timedelta(seconds=LEASE_SECONDS)
+        # Conditional claim under the write lock: another worker cannot take the same run row.
+        ledger.execute('''UPDATE behavior_runs SET state='running',lease_owner=%s,lease_until=%s,
+            started_at=COALESCE(started_at, UTC_TIMESTAMP()) WHERE id=%s AND state='queued' ''',
+                       (worker_id, lease_until, run['id']))
+        run = get_run(ledger, run['id'])
+        if run['state'] != RunState.RUNNING or run['lease_owner'] != worker_id:
+            return None
+        attempt = run['attempt']
+
+    def persist(checkpoint):
+        with register(write=True) as ledger:
+            # Only the live generation may write checkpoints; stale workers become no-ops.
+            ledger.execute('''UPDATE behavior_runs SET checkpoint=%s,lease_until=%s
+                WHERE id=%s AND state='running' AND lease_owner=%s AND attempt=%s''',
+                           (encode(checkpoint), datetime.utcnow() + timedelta(seconds=LEASE_SECONDS),
+                            run['id'], worker_id, attempt))
+
+    previous = run['checkpoint']
+    try:
+        result = fit(run['input_snapshot']['points'], run['requested_clusters'],
+                     checkpoint=previous, on_step=persist)
+    except (ArithmeticError, ValueError, KeyError) as error:
+        with register(write=True) as ledger:
+            current = get_run(ledger, run['id'])
+            if current['attempt'] != attempt or current['lease_owner'] != worker_id:
+                return None
             reasons = [{'code': 'calculation_failed'}]
-            ledger.execute("UPDATE behavior_runs SET state='failed',reasons=%s WHERE id=%s", (encode(reasons), run['id']))
-            ledger.audit('worker', 'run_failed', run['id'], {'error_type': type(error).__name__})
-            return
+            ledger.execute('''UPDATE behavior_runs SET state='failed',reasons=%s,checkpoint=NULL,
+                lease_owner=NULL,lease_until=NULL WHERE id=%s''', (encode(reasons), run['id']))
+            ledger.audit(worker_id, 'run_failed', run['id'],
+                         {'attempt': attempt, 'error_type': type(error).__name__})
+        return run['id']
+
+    with register(write=True) as ledger:
+        current = get_run(ledger, run['id'])
+        if current['attempt'] != attempt or current['lease_owner'] != worker_id:
+            # A newer generation superseded this calculation; the late result must never overwrite it.
+            return None
+        snapshot, checksum, reasons = collect_snapshot(
+            ledger, current['from_day'], current['through_day'], current['requested_clusters'])
+        if checksum != current['fingerprint'] or reasons:
+            # Source data moved while computing: recompute on the same run row with a fresh generation.
+            next_attempt = attempt + 1
+            state = RunState.PAUSED if reasons else RunState.QUEUED
+            if not reasons:
+                reasons = [{'code': 'source_changed'}]
+            ledger.execute('''UPDATE behavior_runs SET state=%s,attempt=%s,reasons=%s,input_snapshot=%s,
+                fingerprint=%s,result=NULL,checkpoint=NULL,lease_owner=NULL,lease_until=NULL,started_at=NULL
+                WHERE id=%s''', (state, next_attempt, encode(reasons), encode(snapshot), checksum, run['id']))
+            ledger.audit(worker_id, f'run_{state}', run['id'],
+                         {'attempt': next_attempt, 'reasons': reasons, 'superseded_attempt': attempt})
+            return run['id']
         if result is None:
             reasons = [{'code': 'identical_profiles'}]
-            ledger.execute("UPDATE behavior_runs SET state='paused',reasons=%s WHERE id=%s", (encode(reasons), run['id']))
-            ledger.audit('worker', 'run_paused', run['id'], {'reasons': reasons})
-            return
-        ledger.execute("UPDATE behavior_runs SET state='review',result=%s WHERE id=%s", (encode(result), run['id']))
-        ledger.audit('worker', 'run_computed', run['id'], {'groups': len(result['groups'])})
+            ledger.execute('''UPDATE behavior_runs SET state='paused',reasons=%s,checkpoint=NULL,
+                lease_owner=NULL,lease_until=NULL WHERE id=%s''', (encode(reasons), run['id']))
+            ledger.audit(worker_id, 'run_paused', run['id'], {'attempt': attempt, 'reasons': reasons})
+            return run['id']
+        ledger.execute('''UPDATE behavior_runs SET state='review',result=%s,checkpoint=NULL,
+            lease_owner=NULL,lease_until=NULL WHERE id=%s''', (encode(result), run['id']))
+        ledger.audit(worker_id, 'run_computed', run['id'], {'attempt': attempt, 'groups': len(result['groups'])})
+    return run['id']
 
 
 def confirm_run(run_id, form, actor):
@@ -108,8 +201,21 @@ def confirm_run(run_id, form, actor):
         run = get_run(ledger, run_id)
         if run['state'] != RunState.REVIEW:
             raise HTTPException(409, '只有待运营确认的分群可发布')
-        if not verify_source(ledger, run, actor):
-            return {'id': run_id, 'state': RunState.PAUSED, 'created_tasks': 0}
+        if form.attempt != run['attempt']:
+            raise HTTPException(409, '这版分群结果已过期，请重新查看最新结果后再确认')
+        snapshot, checksum, reasons = collect_snapshot(
+            ledger, run['from_day'], run['through_day'], run['requested_clusters'])
+        if checksum != run['fingerprint'] or reasons:
+            # Source changed while the operator was reading: requeue on the same row and ask for a re-read.
+            next_attempt = run['attempt'] + 1
+            state = RunState.PAUSED if reasons else RunState.QUEUED
+            if not reasons:
+                reasons = [{'code': 'source_changed'}]
+            ledger.execute('''UPDATE behavior_runs SET state=%s,attempt=%s,reasons=%s,input_snapshot=%s,
+                fingerprint=%s,result=NULL,checkpoint=NULL,lease_owner=NULL,lease_until=NULL,started_at=NULL
+                WHERE id=%s''', (state, next_attempt, encode(reasons), encode(snapshot), checksum, run_id))
+            ledger.audit(actor, f'run_{state}', run_id, {'attempt': next_attempt, 'reasons': reasons})
+            raise HTTPException(409, '源数据已更新，分群正在按最新基线重算，请重新查看后再确认')
         candidates = [(group['number'], member) for group in run['result']['groups']
                       for member in group['members'] if member['action']]
         task_ids = []

@@ -84,7 +84,9 @@ async function refresh() {
     if (token !== generation) return;
     Object.assign(state, data);
     shell(key, pages[key].render(params));
-    if (key === 'groups' && data.run?.state === 'queued') poll = setTimeout(refresh, 1200);
+    if (key === 'groups' && (data.run?.state === 'queued' || data.run?.state === 'running')) {
+      poll = setTimeout(refresh, 1200);
+    }
   } catch (error) {
     if (token !== generation) return;
     if (error.status === 401) logout();
@@ -126,9 +128,13 @@ async function change(form, fields, submitter) {
       const run = await api.requestRun({...fields, clusters: Number(fields.clusters)});
       return {location: `#groups?run=${run.id}`, message: run.state === 'paused' ? '分群暂停，请查看原因' : '已收到分群请求'};
     }
+    case 'retry-run': {
+      const run = await api.retryRun(id);
+      return {location: `#groups?run=${id}`, message: run.state === 'paused' ? '仍有阻塞，请查看暂停原因' : '已在原运行上重新排队计算'};
+    }
     case 'confirm': {
-      const result = await api.confirm(id, fields);
-      return {message: result.state === 'paused' ? '源数据已变化，分群已暂停' : `运营已确认，派发 ${result.created_tasks} 项宣教任务`};
+      const result = await api.confirm(id, {...fields, attempt: Number(form.dataset.attempt)});
+      return {message: `运营已确认，派发 ${result.created_tasks} 项宣教任务`};
     }
     case 'deliver':
       await api.deliver(id, fields);
@@ -170,7 +176,15 @@ app.addEventListener('submit', async event => {
     else await refresh();
   } catch (error) {
     if (error.status === 401 && form.dataset.action !== 'login') logout();
-    else { errorNode.textContent = error.message; errorNode.hidden = false; }
+    else {
+      errorNode.textContent = error.message;
+      errorNode.hidden = false;
+      // A stale view was rejected: reload the run so the operator reads the newest generation before retrying.
+      if (error.status === 409 && ['confirm', 'retry-run'].includes(form.dataset.action)) {
+        announce(error.message);
+        await refresh();
+      }
+    }
   } finally {
     buttons.forEach(button => { button.disabled = false; });
   }

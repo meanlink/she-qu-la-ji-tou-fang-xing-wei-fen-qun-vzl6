@@ -12,12 +12,12 @@ from redis.exceptions import RedisError
 from starlette.concurrency import run_in_threadpool
 
 from scripts.seed_demo import seed
-from src.contracts import Delivery, Login, Note, RegisterPoint, Relocation, Role, RunRequest, Window
+from src.contracts import Delivery, Login, Note, RegisterPoint, Relocation, Role, RunConfirmation, RunRequest, Window
 from src.fieldwork import add_point, add_window, propose_move, resolve_move
 from src.outreach import deliver, review_retest
 from src import quality, workflow_schema
 from src.workflow_routes import router as workflow_router
-from src.runs import confirm_run, get_run, queue_run
+from src.runs import confirm_run, get_run, queue_run, retry_run
 from src.security import allow, login, signed_in
 from src.storage import register
 
@@ -148,7 +148,7 @@ def record_window(form: Window, staff=Depends(field_staff)):
 @app.get('/runs')
 def runs(staff=Depends(signed_in)):
     with register() as ledger:
-        return ledger.rows('''SELECT id,from_day,through_day,state,requested_clusters,created_at
+        return ledger.rows('''SELECT id,from_day,through_day,state,attempt,requested_clusters,checkpoint,created_at
             FROM behavior_runs ORDER BY id DESC LIMIT 40''')
 
 
@@ -163,8 +163,13 @@ def request_run(form: RunRequest, staff=Depends(field_staff)):
     return queue_run(form, staff['username'])
 
 
+@app.post('/runs/{run_id}/retry', status_code=202)
+def retry(run_id: int, staff=Depends(field_staff)):
+    return retry_run(run_id, staff['username'])
+
+
 @app.post('/runs/{run_id}/confirm')
-def publish(run_id: int, form: Note, staff=Depends(operations)):
+def publish(run_id: int, form: RunConfirmation, staff=Depends(operations)):
     return confirm_run(run_id, form, staff['username'])
 
 

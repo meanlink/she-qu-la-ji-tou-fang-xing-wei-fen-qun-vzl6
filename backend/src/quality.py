@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from src.contracts import Note, Role
 from src.fieldwork import required
+from src.runs import resume_after_review
 from src.security import allow, signed_in
 from src.storage import register
 
@@ -79,7 +80,11 @@ def decide(identifier: int, data: Decision, staff=Depends(operations)):
         ledger.execute('''UPDATE sample_challenges SET state=%s,decision_note=%s,decided_by=%s,decided_at=NOW()
                           WHERE window_id=%s''', (data.decision, data.note, staff['username'], identifier))
         ledger.audit(staff['username'], 'sampling_decided', identifier, {'state': data.decision, 'note': data.note})
-        return {'state': data.decision}
+        # A ruling may clear the last review blocker; the affected runs continue on their original rows.
+        resumed = resume_after_review(ledger, [identifier])
+        if resumed:
+            ledger.audit(staff['username'], 'run_resumed', resumed[0], {'run_ids': resumed, 'window_id': identifier})
+        return {'state': data.decision, 'resumed_runs': resumed}
 
 
 def qualifies_for_dispatch(window):

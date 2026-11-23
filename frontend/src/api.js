@@ -41,6 +41,7 @@ export const api = {
   resolve: (id, action, data) => call(`/points/${id}/relocation/${action}`, data),
   windows: () => call('/windows'), addWindow: data => call('/windows', data),
   runs: () => call('/runs'), run: id => call(`/runs/${id}`), requestRun: data => call('/runs', data),
+  retryRun: id => call(`/runs/${id}/retry`, {}),
   confirm: (id, data) => call(`/runs/${id}/confirm`, data),
   tasks: () => call('/tasks'), deliver: (id, data) => call(`/tasks/${id}/delivery`, data),
   review: (id, data) => call(`/tasks/${id}/review`, data),

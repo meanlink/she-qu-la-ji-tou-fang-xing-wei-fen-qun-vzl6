@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import pymysql
 from pymysql.cursors import DictCursor
 
-JSON_COLUMNS = {'reasons', 'input_snapshot', 'result', 'baseline', 'facts'}
+JSON_COLUMNS = {'reasons', 'input_snapshot', 'result', 'baseline', 'facts', 'checkpoint'}
 
 
 def encode(value):

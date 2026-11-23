@@ -27,6 +27,7 @@ class TaskState(StrEnum):
 
 class RunState(StrEnum):
     QUEUED = 'queued'
+    RUNNING = 'running'
     PAUSED = 'paused'
     REVIEW = 'review'
     CONFIRMED = 'confirmed'
@@ -89,6 +90,11 @@ class RunRequest(Form):
         if not 0 <= (self.through_day - self.from_day).days <= 30 or self.through_day > local_day():
             raise ValueError('基线须为截至今日的连续 1–31 天')
         return self
+
+
+class RunConfirmation(Note):
+    # Attempt generation the operator was looking at; stale views must re-read before confirming.
+    attempt: int = Field(gt=0)
 
 
 class Delivery(Note):
